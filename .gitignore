@@ -1,0 +1,10 @@
+node_modules/
+dist/
+
+# Credenciales de sesión: claves privadas de Noise y Signal.
+.wasa/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
