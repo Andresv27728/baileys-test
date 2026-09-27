@@ -8,7 +8,7 @@
 import { Buffer } from 'node:buffer'
 import { decode, encode, type ProtoObject } from '../proto/codec.ts'
 import { Message, MessageContext, MessageKey, WebMessageInfo, MessageStatus, ContextInfo as ContextInfoProto } from '../proto/schema.ts'
-import type { AnyMessageContent, ContextInfo, WAMessageKey } from './types.ts'
+import type { AnyMessageContent, ContextInfo, WAMessageKey, WAMessageContent } from './types.ts'
 import { isJidGroup, parseJid } from '../util/jid.ts'
 import { createHash } from 'node:crypto'
 
@@ -177,6 +177,27 @@ function randomBytesBytes(n: number): Buffer {
 
 function sha256Bytes(data: Buffer): Buffer {
 	return createHash('sha256').update(data).digest()
+}
+
+/**
+ * Saca el texto legible de un mensaje recibido, sea del tipo que sea.
+ *
+ * Un bot casi siempre empieza por esto, y hacerlo a mano acaba en un `if` por
+ * cada tipo: un chat normal viene en `conversation`, pero con previsualización
+ * de enlaces viene en `extendedTextMessage`, una foto con pie en
+ * `imageMessage.caption`... Devuelve cadena vacía cuando no hay texto (audio,
+ * sticker, ubicación...).
+ */
+export function extractMessageText(content: WAMessageContent | undefined): string {
+	if (!content) return ''
+	if (typeof content.conversation === 'string' && content.conversation.length > 0) return content.conversation
+	const extended = content.extendedTextMessage?.text
+	if (typeof extended === 'string' && extended.length > 0) return extended
+	for (const caption of [content.imageMessage?.caption, content.videoMessage?.caption, content.documentMessage?.caption]) {
+		if (typeof caption === 'string' && caption.length > 0) return caption
+	}
+	if (content.editedMessage) return extractMessageText(content.editedMessage)
+	return ''
 }
 
 export { decode, encode, Message, MessageContext, MessageKey, WebMessageInfo, parseJid }

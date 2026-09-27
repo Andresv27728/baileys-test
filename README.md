@@ -14,6 +14,8 @@ Lo que está verificado con tests (46, todos en verde):
 - Double Ratchet: ida y vuelta, mensajes fuera de orden, rechazo de duplicados,
   serialización del estado.
 - Emparejamiento: formato del código de 8 caracteres, payload del QR, validación.
+- Extracción de texto de mensajes: chats, enlaces, pies de foto, vídeo, documento
+  y mensajes editados.
 
 Lo que **no** está verificado contra tráfico real: el handshake con el servidor,
 el formato exacto del QR, la clave del prekey firmado y el resto del protocolo
@@ -85,6 +87,47 @@ npm run cli -- watch
 npm run cli -- logout
 ```
 
+## Bot
+
+Hay un bot completo y funcional en `examples/bot.ts`:
+
+```bash
+npm run bot
+```
+
+Atiende `/help`, `/ping`, `/echo <texto>` y `/hora`, y trae resueltas las tres
+cosas que suelen romper un bot:
+
+- **No contesta a sus propios mensajes** ni a los status (`status@broadcast`).
+- **Deduplica por id de mensaje.** WhatsApp reenvía notificaciones y al
+  sincronizar llega todo el historial; sin esto el bot contesta dos veces, o a
+  mil mensajes viejos.
+- **Un handler que lance no tumba el proceso**, y `Ctrl-C` cierra limpio.
+
+Si escribes el tuyo, extrae el texto con `extractMessageText()`, que es pública
+y está testeada:
+
+```ts
+import { WaSocket, extractMessageText } from 'wasa'
+
+const sock = new WaSocket({ sessionId: 'bot' })
+
+sock.on('messages.upsert', ({ messages }) => {
+	for (const msg of messages) {
+		if (msg.key.fromMe) continue // sin esto se contesta a sí mismo
+		const texto = extractMessageText(msg.message)
+		if (!texto) continue // audio, sticker, ubicación...
+		void sock.sendText(msg.key.remoteJid, `me.has dicho: ${texto}`)
+	}
+})
+
+await sock.connect()
+```
+
+Variables de entorno: `WASA_SESSION` (nombre de la sesión, por defecto `bot`) y
+`WASA_PHONE` (si está, el bot arranca pidiendo emparejamiento por código en vez de
+QR).
+
 ## La clave estática del servidor
 
 El handshake de Noise necesita la clave estática de 32 bytes del servidor para
@@ -127,6 +170,8 @@ src/
   store/      memoria y SQLite
   socket/     WaSocket, eventos, emparejamiento, timers
   api/        superficie pública
+examples/
+  bot.ts      bot de ejemplo, punto de partida
 test/
 ```
 

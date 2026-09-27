@@ -26,6 +26,7 @@ export {
 	textMessage,
 	buildProtocolMessage,
 	fillMediaMetadata,
+	extractMessageText,
 	decode,
 	encode,
 	parseJid
