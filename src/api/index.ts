@@ -8,6 +8,17 @@
 
 export { WaSocket } from '../socket/client.ts'
 export { MessageQueue } from '../socket/events.ts'
+export {
+	PAIRING_TIMEOUT_MS,
+	QR_REFRESH_MS,
+	buildQrPayload,
+	generatePairingCode,
+	isValidPairingCode,
+	normalizePairingCode,
+	normalizePhoneNumber,
+	parseQrPayload
+} from '../socket/pairing.ts'
+export type { PairingState } from '../socket/pairing.ts'
 
 export {
 	generateMessageId,

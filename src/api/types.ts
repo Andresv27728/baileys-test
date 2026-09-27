@@ -123,36 +123,44 @@ export type SendMessageOptions = {
 }
 
 export interface WASocketConfig {
-	/** tu numero, solo necesario para pedir el pairing por número */
-	phoneNumber?: string
 	/** nombre de la sesión, para no chocar con otras en el mismo store */
 	sessionId?: string
-	/** token de release; si no, se usa el de por defecto */
-	version?: import('../transport/version.js').WaVersion
+	/** método de emparejamiento: QR (por defecto) o código de 8 caracteres */
+	pairingMethod?: 'qr' | 'code'
+	/** tu número, necesario para emparejar por código */
+	phoneNumber?: string
+	/** región del teléfono, para el prefijo numérico */
+	countryCode?: string
+	/**
+	 * Clave estática del servidor (32 bytes) para el handshake de Noise.
+	 *
+	 * WhatsApp Web ya no la publica en el HTML ni en los bundles de forma
+	 * legible, así que hay que aportarla. También se puede dar con la variable
+	 * de entorno `WASA_STATIC_KEY` en base64.
+	 */
+	staticKey?: Buffer
+	/** URL de un JSON `{ "staticKey": "<base64>" }` con la clave del servidor */
+	serverConfigUrl?: string
 	/** User-Agent propio del transporte */
 	userAgent?: string
+	/** token de release; si no, se usa el de por defecto */
+	version?: import('../transport/version.js').WaVersion
 	/** ms entre reconexiones */
 	reconnectDelayMs?: number
 	maxReconnectDelayMs?: number
 	/** nº máximo de reintentos antes de rendirse */
 	maxReconnectAttempts?: number
 	keepAliveIntervalMs?: number
+	/** intervalo con el que se rota el QR mientras se espera el escaneo */
+	qrRefreshMs?: number
+	/** clave de presencia */
+	presence?: 'available' | 'unavailable'
 	/** implementaciones alternativas */
 	logger?: unknown
 	store?: import('../store/types.js').BaseStore
-	/** región del teléfono, para el prefijo numérico */
-	countryCode?: string
-	/** aggressividad del sync inicial */
-	syncFullHistory?: boolean
-	/** clave de presencia */
-	presence?: 'available' | 'unavailable'
-	/** el número se pide por SMS en vez de QR */
-	agentConfig?: { agentId: string; agentName?: string; platform?: number; version?: number }
-	/** número máximo de mensajes en vuelo */
+	/** mostrar el QR por stdout además de emitirlo */
 	printQR?: boolean
 	getMessage?: (key: WAMessageKey) => Promise<WAMessage | undefined>
 	/** claves P-256 de la sesión, para el token de versión */
 	token?: { key: Buffer; cert?: Buffer }
-	/** número con prefijo de país, para el registro en vez de QR */
-	fetchAgent?: boolean
 }

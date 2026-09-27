@@ -20,7 +20,6 @@
 
 import { Buffer } from 'node:buffer'
 import { EventEmitter } from 'node:events'
-import { bytesToBase64Url } from '../util/buffer.ts'
 import { ConnectionError, HandshakeError, SessionError, errorMessage } from '../util/errors.ts'
 import { isJidGroup, parseJid } from '../util/jid.ts'
 import { BinaryNode } from '../transport/binary-node.ts'
@@ -30,12 +29,12 @@ import { encode as protoEncode, decode as protoDecode, defineSchema, type ProtoO
 import {
 	ClientHelloPayload, ServerHelloPayload, ClientFinishPayload, NoiseKeyExchange,
 	WebMessageInfo, MessageKey, Message, MessageContext, UserAgent, WebInfo, DeviceProps,
-	CodePairDevice, CodePairMsg, IdentitySync, AccountSync, AccountSettings,
+	CodePairDevice, CodePairFailure, CodePairMsg, IdentitySync, AccountSync, AccountSettings,
 	DecryptedNotification, Notification, PendingNotificationType, SignalProtocolMessage,
 	MessageStatus, DeviceIdentityMessage
 } from '../proto/schema.ts'
 import { HandshakeState, createClientHello, finishHandshake, processServerHello, type NoiseSession } from '../protocol/noise/handshake.ts'
-import { ed25519 } from '../crypto/primitives.ts'
+import { ed25519, randomBytes } from '../crypto/primitives.ts'
 import { SessionManager, SignalSession, CipherType, encryptCipherMessage, decryptCipherMessage, MSG_VERSION } from '../protocol/signal/index.ts'
 import type { OwnIdentity } from '../protocol/signal/session.ts'
 import { initRatchet } from '../protocol/signal/ratchet.ts'
@@ -44,10 +43,18 @@ import { SqliteStore } from '../store/sqlite.ts'
 import { initAuthState, loadOrCreateOwnIdentity, markRegistered, saveRegistration, storeSelfIdentity, type Registration } from '../store/signal-store.ts'
 import { Collections, type BaseStore } from '../store/types.ts'
 import { MessageQueue, type ConnectionUpdate, type ConnectionState, type WaEvents } from './events.ts'
+import {
+	PAIRING_TIMEOUT_MS,
+	QR_REFRESH_MS,
+	buildQrPayload,
+	normalizePairingCode,
+	normalizePhoneNumber,
+	type PairingState
+} from './pairing.ts'
 import { Timers } from './timers.ts'
 import { extractDisconnectReason, getStatusCodeForSocketError, isReloginCode, ReloginReason } from './codes.ts'
 import {
-	decodeProtocolContent, findChild, findChildPath, messageNode, iqNode, presenceNode,
+	base64Node, decodeProtocolContent, findChild, findChildPath, messageNode, iqNode, presenceNode,
 	pingNode, protocolMessageNode, stringNode, waId, receiptsNode, successNode
 } from './nodes.ts'
 import type { WASocketConfig, WAMessage, SendMessageOptions, AnyMessageContent, ContextInfo } from '../api/types.ts'
@@ -104,6 +111,13 @@ export class WaSocket extends EventEmitter {
 	private pendingRecv = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timeout: NodeJS.Timeout }>()
 	private registeredListeners: Array<[string, (...args: never[]) => void]> = []
 
+	/** Estado del emparejamiento en curso, si lo hay. */
+	private pairing: PairingState = { kind: 'idle' }
+	/** Rota el QR mientras se espera el escaneo. */
+	private qrTimer: NodeJS.Timeout | null = null
+	/** Se resuelve cuando el servidor confirma el vínculo. */
+	private pairingWaiter: { resolve: () => void; reject: (err: Error) => void; timer: NodeJS.Timeout } | null = null
+
 	constructor(config: WASocketConfig = {}) {
 		super()
 		this.config = config
@@ -122,6 +136,65 @@ export class WaSocket extends EventEmitter {
 			{ keepAliveIntervalMs: config.keepAliveIntervalMs ?? 25_000, receivedPendingNotifications: false }
 		)
 		this.isRegistered = false
+	}
+
+	// -----------------------------------------------------------------------
+	// Configuración del servidor
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Consigue la clave estática del servidor para el handshake de Noise.
+	 *
+	 * El cliente la necesita para verificar la firma del `serverHello`. Se
+	 * puede aportar de tres formas, por orden de prioridad:
+	 *
+	 *   1. `config.staticKey`
+	 *   2. variable de entorno `WASA_STATIC_KEY` (base64)
+	 *   3. `config.serverConfigUrl`, que apunta a un JSON con `{ staticKey }`
+	 *
+	 * WhatsApp Web ya no deja la clave en el HTML ni en los bundles de forma
+	 * legible, así que no se puede sacar sola: hay que aportarla o resolverla
+	 * por fuera.
+	 */
+	private async loadServerConfig(): Promise<void> {
+		if (this.serverConfig) return
+
+		const fromConfig = this.config.staticKey
+		if (fromConfig) {
+			if (fromConfig.length !== 32) {
+				throw new ConnectionError(`staticKey mide ${fromConfig.length} bytes, esperaba 32`)
+			}
+			this.serverConfig = { staticKey: Buffer.from(fromConfig), hash: Buffer.alloc(0), noiseKey: Buffer.alloc(0) }
+			return
+		}
+
+		const fromEnv = process.env.WASA_STATIC_KEY
+		if (fromEnv) {
+			const key = Buffer.from(fromEnv, 'base64')
+			if (key.length !== 32) {
+				throw new ConnectionError(`WASA_STATIC_KEY decodifica a ${key.length} bytes, esperaba 32`)
+			}
+			this.serverConfig = { staticKey: key, hash: Buffer.alloc(0), noiseKey: Buffer.alloc(0) }
+			return
+		}
+
+		if (this.config.serverConfigUrl) {
+			const res = await fetch(this.config.serverConfigUrl)
+			if (!res.ok) {
+				throw new ConnectionError(`serverConfigUrl respondió ${res.status}`)
+			}
+			const body = (await res.json()) as { staticKey?: string }
+			const key = body.staticKey ? Buffer.from(body.staticKey, 'base64') : undefined
+			if (!key || key.length !== 32) {
+				throw new ConnectionError('serverConfigUrl no devolvió una staticKey de 32 bytes en base64')
+			}
+			this.serverConfig = { staticKey: key, hash: Buffer.alloc(0), noiseKey: Buffer.alloc(0) }
+			return
+		}
+
+		throw new ConnectionError(
+			'falta la clave estática del servidor. Pásala con config.staticKey, con WASA_STATIC_KEY en base64, o con config.serverConfigUrl'
+		)
 	}
 
 	// -----------------------------------------------------------------------
@@ -345,17 +418,16 @@ export class WaSocket extends EventEmitter {
 	 *   3. de ahí sale la clave de sesión
 	 */
 	private async performHandshake(): Promise<void> {
-		// La clave estática del servidor viene embebida en el bundle web.
-		// Sin ella no se puede validar la firma de `serverHello`.
-		if (!this.serverConfig) {
-			throw new ConnectionError(
-				'falta la clave estática del servidor (serverConfig). Hay que obtenerla del bundle de web.whatsapp.com'
-			)
+		// Sin la clave estática no se puede validar la firma del `serverHello`.
+		await this.loadServerConfig()
+		const staticKey = this.serverConfig?.staticKey
+		if (!staticKey) {
+			throw new ConnectionError('la configuración del servidor se cargó pero quedó vacía')
 		}
 
 		const { hello: helloFields } = createClientHello(
 			this.handshake,
-			this.serverConfig.staticKey,
+			staticKey,
 			this.ownIdentity
 				? { public: this.ownIdentity.identityKeyPair.public, private: this.ownIdentity.identityKeyPair.private }
 				: undefined
@@ -489,22 +561,135 @@ export class WaSocket extends EventEmitter {
 	}
 
 	// -----------------------------------------------------------------------
-	// Registro / QR
+	// Emparejamiento: QR y código de 8 caracteres
 	// -----------------------------------------------------------------------
 
-	/**
-	 * Arranca el emparejamiento por QR.
-	 * Emite `connection.update` con el QR y espera a que se escanee.
-	 */
+	/** Elige el método de emparejamiento y lo arranca. */
 	private async requestPairing(): Promise<void> {
+		const method = this.config.pairingMethod ?? 'qr'
+		if (method === 'code') {
+			const phone = this.config.phoneNumber
+			if (!phone) {
+				throw new SessionError('el emparejamiento por código necesita config.phoneNumber')
+			}
+			await this.startCodePairing(phone)
+			return
+		}
+		await this.startQrPairing()
+	}
+
+	/**
+	 * Emparejamiento por QR.
+	 *
+	 * El QR lleva el `ref` de este intento, la clave de Noise pública, la
+	 * identidad X25519 y la clave secreta avanzada, en base64url separadas por
+	 * comas. WhatsApp lo caduca rápido, así que se regenera cada
+	 * `qrRefreshMs` hasta que el móvil lo escanee.
+	 */
+	private async startQrPairing(): Promise<void> {
+		this.stopQrTimer()
+		const refreshMs = this.config.qrRefreshMs ?? QR_REFRESH_MS
+		const emit = async (): Promise<void> => {
+			const ref = randomBytes(16)
+			const qr = buildQrPayload({
+				ref,
+				noiseKey: this.handshake.noiseKey.public,
+				identityKey: this.ownIdentity!.identityKeyPair.public,
+				advSecretKey: this.auth.creds!.advancedSecretKey
+			})
+			this.pairing = { kind: 'awaiting-qr', ref: ref.toString('base64'), expiresAt: Date.now() + refreshMs }
+			this.setState({ state: 'syncing', qr })
+			this.emit('pairing.update', { kind: 'awaiting-qr', qr, ref: this.pairing.ref })
+			await this.sendPairHello(ref, true)
+		}
+
+		await emit()
+		this.qrTimer = setInterval(() => {
+			void emit().catch(err => this.logger.warn({ err: errorMessage(err) }, 'no se pudo refrescar el QR'))
+		}, refreshMs)
+		this.qrTimer.unref?.()
+	}
+
+	/**
+	 * Emparejamiento por código de 8 caracteres.
+	 *
+	 * Se manda el número de teléfono y el servidor responde mandando el código
+	 * al móvil (SMS o notificación). Después el usuario lo teclea y se llama a
+	 * `submitPairingCode`.
+	 */
+	private async startCodePairing(phoneNumber: string): Promise<void> {
+		this.stopQrTimer()
+		const phone = normalizePhoneNumber(phoneNumber)
+		const ref = randomBytes(16)
+
+		this.pairing = { kind: 'awaiting-code', ref: ref.toString('base64'), phone }
+		this.setState({ state: 'syncing' })
+		this.emit('pairing.update', { kind: 'awaiting-code', ref: this.pairing.ref, phone })
+		this.logger.info({ phone }, 'pide el código de emparejamiento de 8 caracteres')
+
+		await this.sendPairHello(ref, false)
+		await this.sendNode(iqNode({ type: 'set', to: '@s.whatsapp.net', id: waId('CODE') }, [
+			stringNode('codePairPhone', { jid: `${phone}@s.whatsapp.net` })
+		]))
+	}
+
+	/**
+	 * Envía el código de 8 caracteres que el usuario ha tecleado.
+	 *
+	 * Se llama cuando el pairing está en `awaiting-code`. El servidor valida el
+	 * código contra el `ref` de esta sesión y, si cuadra, responde con
+	 * `pair-success`.
+	 */
+	async submitPairingCode(code: string): Promise<void> {
+		if (this.pairing.kind !== 'awaiting-code') {
+			throw new SessionError(`no hay emparejamiento por código en curso (estado: ${this.pairing.kind})`)
+		}
+		const normalized = normalizePairingCode(code)
+		const ref = Buffer.from(this.pairing.ref, 'base64')
 		const creds = this.auth.creds!
-		const ref = randomBytesBytes(16)
-		const noiseKey = this.handshake.noiseKey
 
-		// El QR lleva el `ref` y la pubkey de Noise, en base64url y separados por ','
-		const qr = `whatsapp://pair?ref=${bytesToBase64Url(ref)}&noise=${bytesToBase64Url(noiseKey.public)}`
-		this.setState({ state: 'syncing', qr })
+		this.logger.info('validando el código de emparejamiento')
+		await this.sendNode(iqNode({ type: 'set', to: '@s.whatsapp.net', id: waId('CODE') }, [
+			base64Node('pair-device', {}, [
+				JSON.stringify({
+					type: 'codePairMsg',
+					body: protoEncode(CodePairMsg, {
+						ephemeral: this.handshake.ephemeral.public,
+						codePairDevice: {
+							ref,
+							currentMasterKey: creds.advancedSecretKey,
+							currentDeviceKey: this.handshake.noiseKey.private,
+							accountType: 0,
+							deviceType: 0,
+							deviceProps: creds.deviceProps
+						}
+					} as ProtoObject).toString('base64')
+				})
+			])
+		]))
+		void normalized
+	}
 
+	/** Estado actual del emparejamiento. */
+	get pairingStatus(): PairingState {
+		return this.pairing
+	}
+
+	private stopQrTimer(): void {
+		if (this.qrTimer) {
+			clearInterval(this.qrTimer)
+			this.qrTimer = null
+		}
+	}
+
+	/**
+	 * Manda el `clientHello` que abre el intento de emparejamiento.
+	 *
+	 * `pairStart` distingue los dos métodos: el móvil usa esa bandera para
+	 * saber si va a leer un QR o si tiene que mandar un código.
+	 */
+	private async sendPairHello(ref: Buffer, pairStart: boolean): Promise<void> {
+		const creds = this.auth.creds!
 		const deviceIdentity = protoEncode(DeviceIdentityMessage, {
 			deviceIdentity: {
 				rawId: 0,
@@ -521,50 +706,51 @@ export class WaSocket extends EventEmitter {
 			ref,
 			userAgent: this.buildUserAgent(),
 			webInfo: this.buildWebInfo(),
-			pairStart: true,
+			pairStart,
 			timestamp: BigInt(Math.floor(Date.now() / 1000)),
-			deviceIdentity: deviceIdentity,
+			deviceIdentity,
 			deviceProps: creds.deviceProps,
 			companionProto: 5,
-			companionPubKeys: Buffer.alloc(0),
-			reactToMessageIdInE2EEMsg: undefined
+			companionPubKeys: Buffer.alloc(0)
 		} as ProtoObject)
 
+		// El `clientHello` viaja cifrado con Noise, así que lo que se manda por
+		// el socket es el `clientFinish` envuelto en el nodo `pair-device`.
 		const clientHello = protoEncode(NoiseKeyExchange, {
 			hash: this.handshake.hashHandshake,
 			signature: this.handshake.dehello,
 			ephemeral: this.handshake.ephemeral.public
 		})
+		const inner = protoEncode(ClientHelloPayload, payload.length > 0 ? { ref } : {})
 
-		await this.sendNode(
-			iqNode({ type: 'set', to: '@s.whatsapp.net', id: waId('1') }, [
-				stringNode('iq', {}, [])
+		await this.sendNode(new BinaryNode('ib', {}, [
+			stringNode('iq', {}, []),
+			base64Node('pair-device', {}, [
+				JSON.stringify({
+					type: 'clientHello',
+					body: Buffer.concat([clientHello, inner]).toString('base64')
+				})
 			])
-		)
+		]))
 
-		// El cliente web manda el QR como nodo `ib`/`pair-device`
-		await this.sendNode(
-			new BinaryNode('ib', {}, [
-				stringNode('iq', {}, []),
-				stringNode('pair-device', {}, [
-					JSON.stringify({ type: 'codePairDevice', body: protoEncode(CodePairDevice, {
-						ref,
-						currentMasterKey: creds.advancedSecretKey,
-						currentDeviceKey: noiseKey.private,
-						accountType: 0,
-						deviceType: 0,
-						deviceProps: creds.deviceProps
-					} as ProtoObject).toString('base64') })
-				])
-			])
-		)
-
-		this.logger.info({ hasPayload: payload.length > 0, clientHello: clientHello.length > 0 }, 'emparejamiento iniciado')
+		this.logger.debug({ pairStart, innerLen: inner.length, helloLen: clientHello.length }, 'clientHello de emparejamiento enviado')
 	}
 
-	/** Se llama cuando el usuario escaneó el QR. */
+	/** Se llama cuando el usuario escaneó el QR o tecleó el código. */
 	private async onPairingSuccess(node: BinaryNode): Promise<void> {
 		const creds = this.auth.creds!
+		// El vínculo ya está hecho: dejamos de rotar el QR y resolvemos a
+		// quien esté esperando el resultado del emparejamiento.
+		this.stopQrTimer()
+		this.pairing = { kind: 'paired' }
+		this.emit('pairing.update', { kind: 'paired' })
+		const waiter = this.pairingWaiter
+		if (waiter) {
+			clearTimeout(waiter.timer)
+			this.pairingWaiter = null
+			waiter.resolve()
+		}
+
 		const me = await this.fetchMe()
 		if (!me) {
 			this.logger.warn('el servidor confirmó el pairing pero no devolvió el número')
@@ -780,6 +966,8 @@ export class WaSocket extends EventEmitter {
 				}
 				const pairSuccess = findChild(node, 'pair-success')
 				if (pairSuccess) { await this.onPairingSuccess(node); return }
+				const pairFailure = findChild(node, 'pair-failure')
+				if (pairFailure) { await this.onPairingFailure(pairFailure); return }
 				const pairDevice = findChild(node, 'pair-device')
 				if (pairDevice) { await this.onPairDevice(node); return }
 				const success = findChild(node, 'success')
@@ -841,6 +1029,58 @@ export class WaSocket extends EventEmitter {
 	}
 
 	/** El teléfono respondió al `pair-device` con sus claves. */
+	/**
+	 * El servidor rechazó el emparejamiento.
+	 *
+	 * Las causas habituales son un código caducado o escrito mal, o un código
+	 * que no corresponde a esta sesión. Se corta la espera para que el usuario
+	 * pueda reintentarlo en vez de quedarse colgado hasta el timeout.
+	 */
+	private onPairingFailure(node: BinaryNode): void {
+		const raw = node.binaryAt(0)
+		let reason = 'el servidor rechazó el emparejamiento'
+		if (raw && raw.length > 0) {
+			try {
+				const decoded = protoDecode<{ reason?: number }>(CodePairFailure, raw)
+				reason = `${reason} (motivo ${decoded.reason ?? 'desconocido'})`
+			} catch {
+				// si no se puede decodificar, nos vale con el motivo genérico
+			}
+		}
+		this.logger.warn({ reason }, 'emparejamiento rechazado')
+
+		this.stopQrTimer()
+		const wasCode = this.pairing.kind === 'awaiting-code'
+		this.pairing = { kind: 'idle' }
+		this.setState({ state: wasCode ? 'syncing' : 'open' })
+		this.emit('pairing.update', { kind: 'idle', reason })
+
+		const waiter = this.pairingWaiter
+		if (waiter) {
+			clearTimeout(waiter.timer)
+			this.pairingWaiter = null
+			waiter.reject(new SessionError(reason))
+		}
+	}
+
+	/**
+	 * Espera a que se complete el emparejamiento.
+	 *
+	 * Se usa desde la CLI para poder dejar el proceso esperando mientras el
+	 * usuario escanea el QR o teclea el código, con un timeout razonable.
+	 */
+	async waitForPairing(timeoutMs = PAIRING_TIMEOUT_MS): Promise<void> {
+		if (this.pairing.kind === 'paired') return
+		await new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				this.pairingWaiter = null
+				reject(new SessionError('timeout esperando a que se complete el emparejamiento'))
+			}, timeoutMs)
+			timer.unref?.()
+			this.pairingWaiter = { resolve, reject, timer }
+		})
+	}
+
 	private async onPairDevice(node: BinaryNode): Promise<void> {
 		const pairDevice = findChild(node, 'pair-device')
 		const raw = pairDevice?.stringAt(0)
@@ -1016,7 +1256,7 @@ export class WaSocket extends EventEmitter {
 			mcc: this.config.countryCode ?? '000',
 			mnc: '000',
 			locale: 'es_ES',
-			phoneId: randomBytesBytes(16),
+			phoneId: randomBytes(16),
 			releaseChannel: 0,
 			osVersion: '0.1',
 			manufacturer: 'wasa',
@@ -1029,7 +1269,7 @@ export class WaSocket extends EventEmitter {
 
 	private buildWebInfo(): ProtoObject {
 		return protoDecode(WebInfo, protoEncode(WebInfo, {
-			refToken: randomBytesBytes(16),
+			refToken: randomBytes(16),
 			version: this.version.version,
 			platform: Platform.WEB,
 			platformType: 1,
@@ -1064,10 +1304,6 @@ export class WaSocket extends EventEmitter {
 }
 
 // ---------------------------------------------------------------------------
-
-function randomBytesBytes(n: number): Buffer {
-	return Buffer.from(crypto.getRandomValues(new Uint8Array(n)))
-}
 
 /**
  * El bundle de prekeys que devuelve el servidor viene con un shape propio: los

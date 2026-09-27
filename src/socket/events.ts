@@ -79,6 +79,8 @@ export interface WaEvents {
 	'call': (d: { id: string; from: string; status: string; isVideo: boolean; isGroup: boolean }) => void
 	'media.update': (d: { key: WAMessageKey; update: { status: 'PENDING' | 'SERVER_ACK' | 'SUCCESS' | 'ERROR' } }) => void
 	'logout': (d: { reason: string; message?: string }) => void
+	/** el emparejamiento por QR puede empezar o se ha rechazado */
+	'pairing.update': (d: { kind: 'awaiting-qr' | 'awaiting-code' | 'paired' | 'idle'; qr?: string; ref?: string; phone?: string; reason?: string }) => void
 	'debug': (d: { level: 'trace' | 'debug'; message: string; data?: unknown; node?: BinaryNode | Buffer }) => void
 	'stream.error': (e: Error & { code?: string; stream?: string }) => void
 }
