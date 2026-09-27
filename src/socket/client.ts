@@ -143,18 +143,15 @@ export class WaSocket extends EventEmitter {
 	// -----------------------------------------------------------------------
 
 	/**
-	 * Consigue la clave estática del servidor para el handshake de Noise.
+	 * Config del servidor para el handshake de Noise.
 	 *
-	 * El cliente la necesita para verificar la firma del `serverHello`. Se
-	 * puede aportar de tres formas, por orden de prioridad:
-	 *
-	 *   1. `config.staticKey`
-	 *   2. variable de entorno `WASA_STATIC_KEY` (base64)
-	 *   3. `config.serverConfigUrl`, que apunta a un JSON con `{ staticKey }`
-	 *
-	 * WhatsApp Web ya no deja la clave en el HTML ni en los bundles de forma
-	 * legible, así que no se puede sacar sola: hay que aportarla o resolverla
-	 * por fuera.
+	 * `staticKey` es **opcional**. Antes era obligatoria: el handshake
+	 * verificaba la firma del `serverHello` contra una clave estática embebida en
+	 * `web.whatsapp.com`. El cliente real (`@whiskeysockets/baileys` 7.0.0-rc14,
+	 * `lib/Utils/noise-handler.js`) ya no la pasa a `makeNoiseHandler`, cuya
+	 * firma es solo `{ keyPair, NOISE_HEADER, logger, routingInfo }`; es decir,
+	 * WhatsApp dejó de exigirla. Se sigue admitiendo por si vuelve a hacer
+	 * falta, y si se aporta se usa para verificar.
 	 */
 	private async loadServerConfig(): Promise<void> {
 		if (this.serverConfig) return
@@ -192,9 +189,13 @@ export class WaSocket extends EventEmitter {
 			return
 		}
 
-		throw new ConnectionError(
-			'falta la clave estática del servidor. Pásala con config.staticKey, con WASA_STATIC_KEY en base64, o con config.serverConfigUrl'
-		)
+		// Sin clave: el handshake sigue, pero sin verificación de firma.
+		this.serverConfig = { staticKey: Buffer.alloc(0), hash: Buffer.alloc(0), noiseKey: Buffer.alloc(0) }
+	}
+
+	/** ¿Se aportó una `staticKey` real, o estamos con el placeholder? */
+	private hasStaticKey(): boolean {
+		return this.serverConfig !== null && this.serverConfig.staticKey.some(byte => byte !== 0)
 	}
 
 	// -----------------------------------------------------------------------
@@ -418,11 +419,19 @@ export class WaSocket extends EventEmitter {
 	 *   3. de ahí sale la clave de sesión
 	 */
 	private async performHandshake(): Promise<void> {
-		// Sin la clave estática no se puede validar la firma del `serverHello`.
 		await this.loadServerConfig()
-		const staticKey = this.serverConfig?.staticKey
-		if (!staticKey) {
-			throw new ConnectionError('la configuración del servidor se cargó pero quedó vacía')
+		const staticKey = this.serverConfig?.staticKey ?? Buffer.alloc(32)
+		if (!this.hasStaticKey()) {
+			// El handshake actual de WhatsApp ya no verifica una `staticKey`: valida
+			// una cadena de certificados Ed25519 (`CertChain`) contra la clave
+			// pública `142375...ee6b` con serial 0, y usa AES-256-GCM en vez de
+			// ChaCha20-Poly1305. Ese camino está sin implementar; implementarlo es
+			// lo que falta para que esto conecte de verdad.
+			throw new ConnectionError(
+				'handshake sin implementar: el protocolo actual valida una cadena de certificados ' +
+					'(CertChain, Ed25519, serial 0) y usa AES-256-GCM, no una staticKey con ChaCha20-Poly1305. ' +
+					'Aportar WASA_STATIC_KEY solo habilita el handshake antiguo.'
+			)
 		}
 
 		const { hello: helloFields } = createClientHello(

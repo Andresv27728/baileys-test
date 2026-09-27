@@ -128,6 +128,32 @@ Variables de entorno: `WASA_SESSION` (nombre de la sesión, por defecto `bot`) y
 `WASA_PHONE` (si está, el bot arranca pidiendo emparejamiento por código en vez de
 QR).
 
+## Estado del handshake (importante)
+
+**wasa todavía no conecta con WhatsApp.** El ruido de fondo está en la capa de
+Noise, no en el emparejamiento ni en el bot.
+
+El protocolo actual ya no es el que implementa este repo. Comparado con el
+cliente real (`@whiskeysockets/baileys` 7.0.0-rc14,
+`lib/Utils/noise-handler.js`):
+
+| | wasa (implementado) | WhatsApp real |
+|---|---|---|
+| Verificación del servidor | firma Ed25519 sobre `staticKey` | cadena `CertChain`, clave pública `1423…ee6b`, serial 0 |
+| Cifrado del handshake | ChaCha20-Poly1305 | AES-256-GCM |
+| Clave del servidor | fija y se firma con `staticKey` | cifrada dentro del `serverHello` |
+| Nonce | contador appended al final | IV interno, contador oculto |
+
+`makeNoiseHandler` del cliente real recibe `{ keyPair, NOISE_HEADER, logger,
+routingInfo }`: no hay `staticKey` que pasar. La clave que todo el mundo buscaba
+sigue estando en el bundle, pero no es un `staticKey` para el handshake, es la
+clave pública del certificado intermedio, en hex, y se usa para *verificar*,
+no para descifrar.
+
+Por eso `connect()` falla con un error explícito en vez de fingir que funciona.
+Aportar `WASA_STATIC_KEY` habilita el handshake antiguo, que el servidor ya no
+acepta.
+
 ## La clave estática del servidor
 
 El handshake de Noise necesita la clave estática de 32 bytes del servidor para
